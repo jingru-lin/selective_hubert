@@ -420,7 +420,7 @@ class HubertContrastiveRefDataset(FairseqDataset):
                 wav, ratio = self.mix_audios(wav, interf_speech_1, interf_db_1)
                 # s1 + s3 (s3 != s2)
                 index_interf_2 = np.random.randint(0, len(self.audio_names))
-                while self.audio_sids[index_interf_1] == self.audio_sids[index] or self.audio_sids[index_interf_1] == self.audio_sids[index_interf_2]:
+                while self.audio_sids[index_interf_2] == self.audio_sids[index] or self.audio_sids[index_interf_1] == self.audio_sids[index_interf_2]:
                     index_interf_2 = np.random.randint(0, len(self.audio_names))
                 interf_speech_2 = self.get_audio(index_interf_2)
                 interf_db_2 = np.random.uniform(
