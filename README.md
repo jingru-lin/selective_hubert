@@ -4,7 +4,7 @@
 ```
 git clone -b pretrain https://github.com/jingru-lin/selective_hubert.git
 ```
-### Step 1: 
+### Step 1: Install fairseq
 Follow https://github.com/facebookresearch/fairseq/tree/main and install fairseq (version 0.12.0)
 
 ### Step 2: Prepare tsv and km label file
