@@ -19,7 +19,7 @@ from fairseq.tasks import register_task
 from fairseq.tasks.fairseq_task import FairseqTask
 from omegaconf import MISSING
 
-from hubert_contrastive.data.hubert_primary_speaker_dataset import HubertPrimarySpeakerDataset
+from selective_hubert.data.hubert_primary_speaker_dataset import HubertPrimarySpeakerDataset
 
 logger = logging.getLogger(__name__)
 
