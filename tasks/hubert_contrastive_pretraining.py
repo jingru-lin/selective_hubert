@@ -19,7 +19,7 @@ from fairseq.tasks import register_task
 from fairseq.tasks.fairseq_task import FairseqTask
 from omegaconf import MISSING
 
-from hubert_contrastive.data.hubert_contrastive_dataset_ref import HubertContrastiveRefDataset
+from selective_hubert.data.hubert_contrastive_dataset_ref import HubertContrastiveRefDataset
 
 logger = logging.getLogger(__name__)
 
