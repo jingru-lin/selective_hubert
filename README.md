@@ -1,18 +1,18 @@
 # Selective-HuBERT
 
-### Step0: Clone repo
+### Step 0: Clone repo
 ```
 git clone -b pretrain https://github.com/jingru-lin/selective_hubert.git
 ```
 
-### Step1: Prepare tsv and km label file
+### Step 1: Prepare tsv and km label file
 Follow fairseq hubert documentation to produce hubert tsv files and kmeans labels: https://github.com/facebookresearch/fairseq/tree/main/examples/hubert
 
 ### Step 2: Get speaker embeddings
 Follow https://github.com/alibaba-damo-academy/3D-Speaker to extract speaker embeddings
 Use model_id=iic/speech_campplus_sv_zh-cn_16k-common
 
-### Step 3: Download pretrained hubert
+### Step 3: Download pre-trained hubert
 From https://github.com/facebookresearch/fairseq/tree/main/examples/hubert
 
 ### Step 3: Start pretraining
