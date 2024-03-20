@@ -32,7 +32,7 @@ from fairseq.utils import buffered_arange, index_put, is_xla_tensor
 
 from fairseq.models.wav2vec.utils import pad_to_multiple
 
-from hubert_contrastive.modules import CondLayerNorm
+from selective_hubert.modules import CondLayerNorm
 
 EXTRACTOR_MODE_CHOICES = ChoiceEnum(["default", "layer_norm"])
 MASKING_DISTRIBUTION_CHOICES = ChoiceEnum(["static", "uniform", "normal", "poisson"])
