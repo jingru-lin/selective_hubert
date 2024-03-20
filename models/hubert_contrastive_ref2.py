@@ -37,7 +37,7 @@ from fairseq.tasks.hubert_pretraining import (
 from fairseq.checkpoint_utils import load_checkpoint_to_cpu
 from fairseq.utils import buffered_arange, index_put, is_xla_tensor
 
-from hubert_contrastive.models.wav2vec2_1 import (
+from selective_hubert.models.wav2vec2_1 import (
     ConvFeatureExtractionModel,
     TransformerEncoder_1,
 )
