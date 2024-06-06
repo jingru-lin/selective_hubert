@@ -19,7 +19,7 @@ from fairseq.tasks import register_task
 from fairseq.tasks.fairseq_task import FairseqTask
 from omegaconf import MISSING
 
-from selective_hubert.data.hubert_contrastive_dataset_ref import HubertContrastiveRefDataset
+from selective_hubert.data.shubert_dataset import SHubertDataset
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class LabelEncoder(object):
 
 
 @dataclass
-class HubertRefPretrainingConfig(FairseqDataclass):
+class SHubertPretrainingConfig(FairseqDataclass):
     data: str = field(default=MISSING, metadata={"help": "path to data directory"})
     fine_tuning: bool = field(
         default=False, metadata={"help": "set to true if fine-tuning Hubert"}
@@ -135,19 +135,19 @@ class HubertRefPretrainingConfig(FairseqDataclass):
     )
 
 
-@register_task("hubert_contrastive_ref_pretraining", dataclass=HubertRefPretrainingConfig)
-class HubertContrastiveRefPretrainingTask(FairseqTask):
+@register_task("shubert_pretraining", dataclass=SHubertPretrainingConfig)
+class SHubertPretrainingTask(FairseqTask):
 
-    cfg: HubertRefPretrainingConfig
+    cfg: SHubertPretrainingConfig 
 
     def __init__(
         self,
-        cfg: HubertRefPretrainingConfig,
+        cfg: SHubertPretrainingConfig,
     ) -> None:
         super().__init__(cfg)
 
         logger.info(f"current directory is {os.getcwd()}")
-        logger.info(f"HubertRefPretrainingConfig Config {cfg}")
+        logger.info(f"SHubertPretrainingConfig Config {cfg}")
 
         self.cfg = cfg
         self.fine_tuning = cfg.fine_tuning
@@ -173,8 +173,8 @@ class HubertContrastiveRefPretrainingTask(FairseqTask):
 
     @classmethod
     def setup_task(
-        cls, cfg: HubertRefPretrainingConfig, **kwargs
-    ) -> "HubertContrastiveRefPretrainingTask":
+        cls, cfg: SHubertPretrainingConfig, **kwargs
+    ) -> "SHubertPretraining":
         return cls(cfg)
 
     def load_dictionaries(self):
@@ -204,7 +204,7 @@ class HubertContrastiveRefPretrainingTask(FairseqTask):
         paths = [f"{self.get_label_dir()}/{split}.{l}" for l in self.cfg.labels]
 
         # hubert v1: pad_audio=True, random_crop=False;
-        self.datasets[split] = HubertContrastiveRefDataset(
+        self.datasets[split] = SHubertDataset(
             manifest,
             manifest_noise=manifest_noise,
             sample_rate=self.cfg.sample_rate,

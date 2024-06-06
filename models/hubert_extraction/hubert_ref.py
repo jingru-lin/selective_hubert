@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-With pretrained models to extract speaker embeddings
+Conditional speaker at selected transformer layers  
 """
 
 import logging
@@ -14,7 +14,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from omegaconf import II
 
 from fairseq import utils
@@ -37,7 +36,7 @@ from fairseq.tasks.hubert_pretraining import (
 from fairseq.checkpoint_utils import load_checkpoint_to_cpu
 from fairseq.utils import buffered_arange, index_put, is_xla_tensor
 
-from selective_hubert.models.wav2vec2_1 import (
+from selective_hubert.models.hubert_extraction.wav2vec2_1 import (
     ConvFeatureExtractionModel,
     TransformerEncoder_1,
 )
@@ -131,7 +130,9 @@ class HubertRefConfig(FairseqDataclass):
     logit_temp: float = field(
         default=0.1, metadata={"help": "temperature to divide logits by"}
     )
-
+    logit_temp_ctr: float = field(
+        default=0.1, metadata={"help": "temperature to divide logits_ctr by"}
+    )
     target_glu: bool = field(
         default=False, metadata={"help": "adds projection + glu to targets"}
     )
@@ -195,6 +196,16 @@ class HubertRefConfig(FairseqDataclass):
         metadata={"help": "min space between spans (if no overlap is enabled)"},
     )
 
+    # negative selection
+    num_negatives: int = field(
+        default=100,
+        metadata={"help": "number of negative examples from the same sample"},
+    )
+    cross_sample_negatives: int = field(
+        default=0, metadata={"help": "number of negative examples from the any sample"}
+    )
+
+
     # positional embeddings
     conv_pos: int = field(
         default=128,
@@ -250,31 +261,20 @@ class HubertRefConfig(FairseqDataclass):
     )
     fp16: bool = field(default=False, metadata={"help": "If fp16 is being used"})
 
-    # Added config
+
     pretrained_ckpt_path: str = field(
         default="",
         metadata={"help": "pretrained hubert checkpoint"},
     )
-
-    # ctr loss
-    ctr_layer: int = field(
-        default=-1,
-        metadata={"help": "contrastive layers in the transformer"},
-    )
-    
     # speaker
     speaker_injection_layers: List[int] = field(
         default_factory=lambda: [5,6,7],
         metadata={"help": "layers to inject speaker embedding"},
     )
-    speaker_dim: int = field(
-        default=512,
-        metadata={"help": "speaker embedding dimension"},
-    )
 
 
-@register_model("hubert_contrastive_ref2", dataclass=HubertRefConfig)
-class HubertContrastiveRef2Model(BaseFairseqModel):
+@register_model("hubert_ref", dataclass=HubertRefConfig)
+class HubertRefModel(BaseFairseqModel):
     def __init__(
         self,
         cfg: HubertRefConfig,
@@ -321,8 +321,6 @@ class HubertContrastiveRef2Model(BaseFairseqModel):
 
         self.feature_grad_mult = cfg.feature_grad_mult
         self.logit_temp = cfg.logit_temp
-        # self.logit_temp_ctr = cfg.logit_temp_ctr # ctr loss
-        self.ctr_layer = cfg.ctr_layer # ctr loss
         self.skip_masked = cfg.skip_masked
         self.skip_nomask = cfg.skip_nomask
 
@@ -362,13 +360,6 @@ class HubertContrastiveRef2Model(BaseFairseqModel):
             nn.init.uniform_(self.label_embs_concat)
         self._load_weights(cfg.pretrained_ckpt_path)
 
-        # For contrastive loss
-        # self.n_negatives = cfg.num_negatives
-        # self.cross_sample_negatives = cfg.cross_sample_negatives
-        # self.layer_proj = nn.Linear(cfg.encoder_embed_dim, final_dim)
-        # self.num_sc_samples = cfg.num_sc_samples
-        self.linear_block = LinearBlock(cfg.encoder_embed_dim)
-
     def _load_weights(self, pretrained_ckpt_path):
         pretrained_model_dict = load_checkpoint_to_cpu(pretrained_ckpt_path)['model']
         model_dict = self.state_dict()
@@ -400,10 +391,11 @@ class HubertContrastiveRef2Model(BaseFairseqModel):
     def build_model(cls, cfg: HubertRefConfig, task: HubertPretrainingTask):
         """Build a new model instance."""
 
-        model = HubertContrastiveRef2Model(cfg, task.cfg, task.dictionaries)
+        model = HubertRefModel(cfg, task.cfg, task.dictionaries)
         return model
 
-    def get_mask(self, B, T, padding_mask):
+    def apply_mask(self, x, padding_mask, target_list):
+        B, T, C = x.shape
         if self.mask_prob > 0:
             mask_indices = compute_mask_indices(
                 (B, T),
@@ -416,99 +408,32 @@ class HubertContrastiveRef2Model(BaseFairseqModel):
                 no_overlap=self.no_mask_overlap,
                 min_space=self.mask_min_space,
             )
-            # mask_indices = torch.from_numpy(mask_indices).to(x.device)
-            # x[mask_indices] = self.mask_emb
+            mask_indices = torch.from_numpy(mask_indices).to(x.device)
+            x[mask_indices] = self.mask_emb
         else:
             mask_indices = None
 
-        # jr: turn off channel masking first
-        assert self.mask_channel_prob == 0, "Currently don't support channel masking"
-        # return x, mask_indices
-        return mask_indices
+        if self.mask_channel_prob > 0:
+            mask_channel_indices = compute_mask_indices(
+                (B, C),
+                None,
+                self.mask_channel_prob,
+                self.mask_channel_length,
+                self.mask_channel_selection,
+                self.mask_channel_other,
+                no_overlap=self.no_mask_channel_overlap,
+                min_space=self.mask_channel_min_space,
+            )
+            mask_channel_indices = (
+                torch.from_numpy(mask_channel_indices)
+                .to(x.device)
+                .unsqueeze(1)
+                .expand(-1, T, -1)
+            )
+            x[mask_channel_indices] = 0
 
-    def sample_negatives(self, y, num, padding_count=None):
-        if self.n_negatives == 0 and self.cross_sample_negatives == 0:
-            return y.new(0)
+        return x, mask_indices
 
-        bsz, tsz, fsz = y.shape
-        y = y.view(-1, fsz)  # BTC => (BxT)C
-
-        # FIXME: what happens if padding_count is specified?
-        # jr: e.g. y has shape B x 201 x 256, we are choosing 100 negative samples for 201 frames
-        cross_high = tsz * bsz
-        high = tsz - (padding_count or 0)
-        with torch.no_grad():
-            assert high > 1, f"{bsz,tsz,fsz}"
-
-            if self.n_negatives > 0:
-                tszs = (
-                    buffered_arange(num)
-                    .unsqueeze(-1)
-                    .expand(-1, self.n_negatives)
-                    .flatten()
-                )
-                # jr: e.g. tszs = [0,...,0,1,...,1,...,200,...,200], representing 100 negative samples for 201 frames
-
-                neg_idxs = torch.randint(
-                    low=0, high=high - 1, size=(bsz, self.n_negatives * num)
-                ) # jr: randomly choose indexes from 0 to 200 for B batches
-                neg_idxs[neg_idxs >= tszs] += 1 # jr: if idx < tszs, meaning selecting past frames; we left it as it is
-                # if idx >= tszs, meaning selecting current or future frames; we move it 1 frame forward,
-                # this avoids selecting current frames and also cover 'high' (only 'high-1' is used in prev selection)
-
-            if self.cross_sample_negatives > 0:
-                tszs = (
-                    buffered_arange(num)
-                    .unsqueeze(-1)
-                    .expand(-1, self.cross_sample_negatives)
-                    .flatten()
-                )
-
-                cross_neg_idxs = torch.randint(
-                    low=0,
-                    high=cross_high - 1,
-                    size=(bsz, self.cross_sample_negatives * num),
-                )
-                cross_neg_idxs[cross_neg_idxs >= tszs] += 1
-
-        if self.n_negatives > 0:
-            neg_idxs = neg_idxs + (torch.arange(bsz).unsqueeze(1) * high)
-        else:
-            neg_idxs = cross_neg_idxs
-
-        if self.cross_sample_negatives > 0 and self.n_negatives > 0:
-            neg_idxs = torch.cat([neg_idxs, cross_neg_idxs], dim=1)
-
-        neg_idxs[0][0] = 0
-
-        negs = y[neg_idxs.view(-1)]
-        negs = negs.view(
-            bsz, num, self.n_negatives + self.cross_sample_negatives, fsz
-        ).permute(
-            2, 0, 1, 3
-        )  # to NxBxTxC
-        return negs, neg_idxs
-
-    def compute_sim(self, x, y, negatives):
-        neg_is_pos = (y == negatives).all(-1)
-        y = y.unsqueeze(0)
-        targets = torch.cat([y, negatives], dim=0)
-
-        logits = torch.cosine_similarity(x.float(), targets.float(), dim=-1).type_as(x)
-
-        logits = logits / self.logit_temp_ctr
-
-        if is_xla_tensor(logits) or neg_is_pos.any():
-            fillval = -float(2 ** 30)
-            if not hasattr(self, "_inftensor"):
-                self._inftensor = (
-                    torch.tensor(fillval).to(x.device)
-                    if is_xla_tensor(logits)
-                    else float("-inf")
-                )
-            logits[1:] = index_put(logits[1:], neg_is_pos, self._inftensor)
-
-        return logits
 
     def compute_nce(self, x, pos, negs):
         neg_is_pos = (pos == negs).all(-1)
@@ -568,28 +493,18 @@ class HubertContrastiveRef2Model(BaseFairseqModel):
     def forward(
         self,
         source: torch.Tensor,
+        spk_emb: torch.Tensor,
         target_list: Optional[List[torch.Tensor]] = None,
         padding_mask: Optional[torch.Tensor] = None,
         mask: bool = True,
-        paired_source: torch.Tensor = None,
-        spk_emb: torch.Tensor = None,
-        clean_source: torch.Tensor = None,
         features_only: bool = False,
         output_layer: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
-        source = torch.cat([source, paired_source], dim=0)
-        if padding_mask is not None:
-            padding_mask = torch.cat([padding_mask, padding_mask], dim=0)
-
         """output layer is 1-based"""
         features = self.forward_features(source) # B x D x T
-
         # jr: len(target_list[0]) = l
         if target_list is not None:
             features, target_list = self.forward_targets(features, target_list)
-            for j, t in enumerate(target_list): # jr: use same targets for both batches
-                target_list[j] = t.repeat(2, 1)
-        # jr: len(target_list[0]) = 2 * l
 
         features_pen = features.float().pow(2).mean()
 
@@ -603,30 +518,11 @@ class HubertContrastiveRef2Model(BaseFairseqModel):
         if self.post_extract_proj is not None:
             features = self.post_extract_proj(features)
 
-        # FIXME: should i use identical dropouts for both source & paired_source?
         features = self.dropout_input(features)
         # unmasked_features = self.dropout_features(unmasked_features)
 
-        # # clean source
-        # with torch.no_grad():
-        #     clean_features = self.forward_features(clean_source)
-        #     if clean_features.shape[-1] != features.shape[-2]:
-        #         clean_features = clean_features[..., :features.shape[-2]]
-        #     clean_features = clean_features.transpose(1, 2)
-        #     clean_features = self.layer_norm(clean_features)
-        #     if self.post_extract_proj is not None:
-        #         clean_features = self.post_extract_proj(clean_features)
-        #     clean_features = self.dropout_input(clean_features)
-
-        if mask: # FIXME NOT NEEDED NOW: use identical masking for both branches
-            B, T, _ = features.shape
-            mask_indices = self.get_mask(B//2, T, padding_mask)
-            mask_indices = torch.from_numpy(mask_indices).to(features.device)
-            mask_indices = mask_indices.repeat(2, 1)
-            features[mask_indices] = self.mask_emb
-            x = features
-            unmasked_indices = torch.logical_and(~padding_mask, ~mask_indices)
-            # unmasked_indices = ~mask_indices
+        if mask: # jr: use identical masking for both branches
+            x, mask_indices = self.apply_mask(features, padding_mask, target_list)
         else:
             x = features
             mask_indices = None
@@ -638,64 +534,13 @@ class HubertContrastiveRef2Model(BaseFairseqModel):
         # mask_indices: (B, T), bool
         x, layer_results = self.encoder(
             x,
-            spk_emb.repeat(2, 1) if spk_emb is not None else None, # same spk embeddings for source and paired_source
-            # ctr_layer=self.ctr_layer,
-            # need_weights=True,
+            spk_emb,
             padding_mask=padding_mask,
             layer=None if output_layer is None else output_layer - 1,
         )
 
-        # with torch.no_grad():
-        #     tgt_layer = max(self.ctr_layer, -len(layer_results))
-        #     if tgt_layer < 0:
-        #         tgt_layer = len(layer_results) + tgt_layer
-        #     clean_x, clean_layer_results = self.encoder(
-        #         clean_features,
-        #         spk_emb,
-        #         # need_weights=True,
-        #         padding_mask=padding_mask[:B//2, :],
-        #         layer=tgt_layer
-        #     )
-
         if features_only:
             raise NotImplementedError("Please use extract_features() to get features")
-
-        # V1: adopted from contentvec, prepare representation contrastive loss, using unmasked indices
-        score_list = []
-        # if self.training:
-        #     y = layer_results[max(self.ctr_layer, -len(layer_results))]  # LAYER DROP??
-        #     y = y[0].transpose(0, 1)
-        #     y = y[unmasked_indices].view(y.size(0), -1, y.size(-1))
-        #     y_1, y_2 = torch.split(y, B // 2, dim=0)
-        #     y_1 = self.layer_proj(y_1)
-        #     y_2 = self.layer_proj(y_2)
-        #
-        #     negs_1, _ = self.sample_negatives(y_1, y_1.size(1))
-        #     negs_2, _ = self.sample_negatives(y_2, y_2.size(1))
-        #     z_1 = self.compute_sim(y_1, y_2, negs_1)
-        #     z_2 = self.compute_sim(y_2, y_1, negs_2)
-        #     z = torch.cat((z_1, z_2), dim=1)
-        #     score_list.append(z)
-
-        # V2: use attention maps
-        # if self.training:
-        #     attn_maps = layer_results[max(self.ctr_layer, -len(layer_results))]
-        #     attn_maps = attn_maps[1]
-        #     attn_1, attn_2 = torch.split(attn_maps, B // 2, dim=0)
-        #     clean_attn_map = clean_layer_results[-1][1]
-        #     score_1 = torch.norm(attn_1 - clean_attn_map)
-        #     score_2 = torch.norm(attn_2 - clean_attn_map)
-        #     score = score_1 + score_2
-        #     # score = torch.norm(attn_1 - attn_2)
-        #     score_list.append(score)
-
-        # V3:
-        if self.training:
-            if self.ctr_layer == -1:
-                x_1, x_2 = torch.split(self.linear_block(x), B // 2, dim=0)
-                score_list.append(self.barlow_twin_loss(x_1, x_2))
-            else:
-                raise NotImplementedError
 
         def compute_pred(proj_x, target, label_embs):
             # compute logits for the i-th label set
@@ -742,15 +587,146 @@ class HubertContrastiveRef2Model(BaseFairseqModel):
             ]
         else:
             logit_u_list = [None for _ in target_list]
-
         result = {
             "logit_m_list": logit_m_list,
             "logit_u_list": logit_u_list,
             "padding_mask": padding_mask,
             "features_pen": features_pen,
-            "score_list": score_list
         }
         return result
+
+
+    # def forward(
+    #     self,
+    #     source: torch.Tensor,
+    #     target_list: Optional[List[torch.Tensor]] = None,
+    #     padding_mask: Optional[torch.Tensor] = None,
+    #     mask: bool = True,
+    #     ref_source: torch.Tensor = None,
+    #     ref_padding_mask: Optional[torch.Tensor] = None,
+    #     features_only: bool = False,
+    #     output_layer: Optional[int] = None,
+    # ) -> Dict[str, torch.Tensor]:
+    #     """output layer is 1-based"""
+    #     features = self.forward_features(source) # B x D x T
+    #     # jr: len(target_list[0]) = l
+    #     if target_list is not None:
+    #         features, target_list = self.forward_targets(features, target_list)
+    #     # jr: len(target_list[0]) = 2 * l
+    #
+    #     features_pen = features.float().pow(2).mean()
+    #
+    #     features = features.transpose(1, 2)
+    #     features = self.layer_norm(features)
+    #     # unmasked_features = features.clone()
+    #
+    #     if padding_mask is not None:
+    #         padding_mask = self.forward_padding_mask(features, padding_mask) # Get padding mask according to the shape of features
+    #
+    #     if self.post_extract_proj is not None:
+    #         features = self.post_extract_proj(features)
+    #
+    #     # Extract feature for reference audio
+    #     ref_features = self.forward_features(ref_source)
+    #     ref_features = ref_features.transpose(1, 2)
+    #     ref_features = self.layer_norm(ref_features)
+    #     if self.post_extract_proj is not None:
+    #         ref_features = self.post_extract_proj(ref_features)
+    #     if ref_padding_mask is not None:
+    #         ref_padding_mask = self.forward_padding_mask(ref_features, ref_padding_mask)
+    #         ref_features = index_put(ref_features, ref_padding_mask, 0)
+    #
+    #     # Get speaker embedding
+    #     ref_features = self.speaker_proj(ref_features)
+    #     ref_features = ref_features.transpose(1, 2)
+    #     spk_emb = self.conv1d_block_aux(ref_features)
+    #     spk_emb = spk_emb.transpose(1, 2)
+    #     if ref_padding_mask is not None:
+    #         assert ref_padding_mask.shape[1] == spk_emb.shape[1]
+    #         spk_emb = torch.sum(spk_emb, 1)
+    #         ref_output_lengths = (1 - ref_padding_mask.long()).sum(-1)
+    #         coeff = ref_output_lengths.unsqueeze(1).repeat(1, spk_emb.shape[1])
+    #         spk_emb = torch.div(spk_emb, coeff)
+    #     else:
+    #         spk_emb = torch.mean(spk_emb, 1)
+    #
+    #     # FIXME: should i use identical dropouts for both source & paired_source?
+    #     features = self.dropout_input(features)
+    #     # unmasked_features = self.dropout_features(unmasked_features)
+    #
+    #     if mask: # jr: use identical masking for both branches
+    #         x, mask_indices = self.apply_mask(features, padding_mask, target_list)
+    #     else:
+    #         x = features
+    #         mask_indices = None
+    #
+    #     # feature: (B, T, D), float
+    #     # target: (B, T), long
+    #     # x: (B, T, D), float
+    #     # padding_mask: (B, T), bool
+    #     # mask_indices: (B, T), bool
+    #     x, layer_results = self.encoder(
+    #         x,
+    #         spk_emb,
+    #         padding_mask=padding_mask,
+    #         layer=None if output_layer is None else output_layer - 1,
+    #     )
+    #
+    #     if features_only:
+    #         raise NotImplementedError("Please use extract_features() to get features")
+    #
+    #     def compute_pred(proj_x, target, label_embs):
+    #         # compute logits for the i-th label set
+    #         y = torch.index_select(label_embs, 0, target.long())
+    #         negs = label_embs.unsqueeze(1).expand(-1, proj_x.size(0), -1)
+    #         if self.target_glu:
+    #             y = self.target_glu(y)
+    #             negs = self.target_glu(negs)
+    #         # proj_x: (S, D)
+    #         # y: (S, D)
+    #         # negs: (Neg, S, D)
+    #         return self.compute_nce(proj_x, y, negs)
+    #
+    #     # jr: self.label_embs_concat.shape: [504 (500 cluster + some other tokens), 256]
+    #     # jr: self.num_classes = 504
+    #     # jr: torch.split(tensor, split_size_or_section, dim=0): split self.label_embs_concat accordding to indices in self.num_classes
+    #     label_embs_list = self.label_embs_concat.split(self.num_classes, 0)
+    #
+    #     if not self.skip_masked: # jr: self.skip_masked = False
+    #         masked_indices = torch.logical_and(~padding_mask, mask_indices)
+    #         proj_x_m = self.final_proj(x[masked_indices])
+    #         if self.untie_final_proj: # jr: True
+    #             proj_x_m_list = proj_x_m.chunk(len(target_list), dim=-1)
+    #         else:
+    #             proj_x_m_list = [proj_x_m for _ in range(len(target_list))]
+    #         logit_m_list = [
+    #             compute_pred(proj_x_m, t[masked_indices], label_embs_list[i])
+    #             for i, (proj_x_m, t) in enumerate(zip(proj_x_m_list, target_list))
+    #         ]
+    #     else:
+    #         logit_m_list = [None for _ in target_list]
+    #
+    #     if not self.skip_nomask: # jr: self.skip_nomask = False
+    #         nomask_indices = torch.logical_and(~padding_mask, ~mask_indices)
+    #         proj_x_u = self.final_proj(x[nomask_indices])
+    #         if self.untie_final_proj:
+    #             proj_x_u_list = proj_x_u.chunk(len(target_list), dim=-1)
+    #         else:
+    #             proj_x_u_list = [proj_x_u for _ in range(len(target_list))]
+    #
+    #         logit_u_list = [
+    #             compute_pred(proj_x_u, t[nomask_indices], label_embs_list[i])
+    #             for i, (proj_x_u, t) in enumerate(zip(proj_x_u_list, target_list))
+    #         ]
+    #     else:
+    #         logit_u_list = [None for _ in target_list]
+    #     result = {
+    #         "logit_m_list": logit_m_list,
+    #         "logit_u_list": logit_u_list,
+    #         "padding_mask": padding_mask,
+    #         "features_pen": features_pen,
+    #     }
+    #     return result
 
     def extract_features(
         self,
@@ -799,7 +775,7 @@ class HubertContrastiveRef2Model(BaseFairseqModel):
         x, layer_results = self.encoder(
             x,
             spk_emb,
-            padding_amsk=padding_mask,
+            padding_mask=padding_mask,
             layer=None if output_layer is None else output_layer - 1
         )
 
@@ -853,76 +829,3 @@ class HubertContrastiveRef2Model(BaseFairseqModel):
         return logits.new_zeros(
             logits.size(1) * logits.size(2) * len(logits_list),
             dtype=torch.long)
-
-    def barlow_twin_loss(self, z1, z2, num_samples=640, bt_lambda=0.005):
-        """
-        Feature dim size (z1, z2): (bs , t , p_dim)
-           z1, z2 to be random samples of features along temporal frame
-
-        Arguments
-        ---------
-        z1, z2: tensor, Embedded representation of wav
-        num_samples: int, Determine number of token-frames to be sampled
-        bt_lambda: float, Determine the penalization value of off-diagonal element to 0
-        """
-        B, T, C = z1.size()
-        eye = torch.eye(C, dtype=bool, requires_grad=False)
-
-        if num_samples:  # perform frame-token sampling
-            ## get non zeros frames index (remove zero padding tokens from batch representation)
-            # FIXME: the next line is not tested zero padding tokens as the pre-training does not use padding
-            non_zeros = [T - (z1[i] == 0).sum(0).min() for i in range(B)]
-            sample_indices = [[torch.randint(i, size=(int(i / sum(non_zeros) * num_samples),))] for i in non_zeros]
-            # Note that the paper mentioned: "smaller sample size benefits early-stage learning"
-            # Here the sample_indices roughly ranges from [20+] to [90+]
-            #for s in sample_indices:
-            #    print(s[0].shape)
-            z1 = torch.cat([z1[bs][i] for bs, i in enumerate(sample_indices)])
-            z2 = torch.cat([z2[bs][i] for bs, i in enumerate(sample_indices)])
-            T = num_samples
-
-        z1_norm = (z1 - z1.mean(0)) / z1.std(0)
-        z2_norm = (z2 - z2.mean(0)) / z2.std(0)
-
-        c = torch.mm(z1_norm.T, z2_norm) / T
-        #import pickle as pkl
-        #pkl.dump(c.detach().cpu(), open('/raid/hpc/gemeng/se_asr/hubert_contrastive/utils/c_matrix_notctr.pkl', 'wb'))
-        #exit()
-
-        c_diff = (c - eye.float().to(c.device)).pow(2)  # DxD
-        invariance = c_diff * eye.float().to(c_diff.device)
-        redundant = c_diff * (~eye).float().to(c_diff.device) * bt_lambda
-
-        loss = torch.sum(invariance + redundant)
-
-        return loss
-
-class LinearBlock(nn.Module):
-    def __init__(self, in_dim) -> None:
-        super().__init__()
-        self.up1 = nn.Linear(in_dim, 2048)
-        self.norm1 = LayerNorm(2048)
-        self.act1 = nn.SiLU()
-        self.dropout1 = nn.Dropout(0.05)
-        self.down1 = nn.Linear(2048, in_dim)
-        self.norm2 = LayerNorm(in_dim)
-        self.act2 = nn.SiLU()
-        self.dropout2 = nn.Dropout(0.05)
-        self.up2 = nn.Linear(in_dim, 2048)
-
-    def forward(self, x):
-        x = self.up1(x)
-        x = self.norm1(x)
-        x = self.act1(x)
-        x = self.dropout1(x)
-
-        x = self.down1(x)
-        x = self.norm2(x)
-        x = self.act2(x)
-        x = self.dropout2(x)
-
-        x = self.up2(x)
-        return x
-
-
-

@@ -155,7 +155,7 @@ def verify_label_lengths(
         )
 
 
-class HubertContrastiveRefDataset(FairseqDataset):
+class SHubertDataset(FairseqDataset):
     def __init__(
         self,
         manifest_path: str,

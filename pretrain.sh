@@ -1,7 +1,7 @@
 # Pretraining:
 
 ###########################################On Simulted Data#############################################################
-fairseq-hydra-train \
+CUDA_VISIBLE_DEVICES=4,5,6 fairseq-hydra-train \
   --config-dir /dir/to/selective_hubert/config \
   --config-name hubert_contrastive_ref2_base_librispeech.yaml \
   task.data=/dir/to/data \

@@ -1,51 +1,52 @@
-# --------------------------------------------------------
-# WavLM: Large-Scale Self-Supervised  Pre-training  for Full Stack Speech Processing (https://arxiv.org/abs/2110.13900.pdf)
-# Github source: https://github.com/microsoft/unilm/tree/master/wavlm
-# Copyright (c) 2021 Microsoft
-# Licensed under The MIT License [see LICENSE for details]
-# Based on fairseq code bases
-# https://github.com/pytorch/fairseq
-# --------------------------------------------------------
-# Note: this implementation is modified based on
-# https://github.com/microsoft/unilm/tree/master/wavlm
-# and adpated to fit the fairseq module definition.
-# --------------------------------------------------------
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""
+With pretrained models to extract speaker embeddings
+"""
 
 import logging
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from dataclasses import dataclass, field
 import numpy as np
-from omegaconf import II
 import torch
 import torch.nn as nn
-from torch.nn import LayerNorm
+import torch.nn.functional as F
+from omegaconf import II
 
 from fairseq import utils
 from fairseq.data.data_utils import compute_mask_indices
 from fairseq.data.dictionary import Dictionary
 from fairseq.dataclass import ChoiceEnum, FairseqDataclass
 from fairseq.models import BaseFairseqModel, register_model
-from fairseq.modules import GradMultiply
-from fairseq.tasks.hubert_pretraining import (
-    HubertPretrainingConfig,
-    HubertPretrainingTask,
+from fairseq.models.wav2vec.wav2vec2 import (
+    EXTRACTOR_MODE_CHOICES,
+    MASKING_DISTRIBUTION_CHOICES,
+    LAYER_TYPE_CHOICES,
 )
+from fairseq.modules import GradMultiply, LayerNorm
 
-from hubert_contrastive.models.wavlm_extraction.wavlm_encoder import (
-    ConvFeatureExtractionModel, TransformerEncoder
+from fairseq.checkpoint_utils import load_checkpoint_to_cpu
+from fairseq.utils import buffered_arange, index_put, is_xla_tensor
+
+from selective_hubert.tasks.shubert_pretraining import (
+    SHubertPretrainingConfig,
+    SHubertPretrainingTask 
 )
-
+from selective_hubert.models.hubert_extraction.wav2vec2_1 import (
+    ConvFeatureExtractionModel,
+    TransformerEncoder_1,
+)
 
 logger = logging.getLogger(__name__)
 
-EXTRACTOR_MODE_CHOICES = ChoiceEnum(["default", "layer_norm"])
-MASKING_DISTRIBUTION_CHOICES = ChoiceEnum(["static", "uniform", "normal", "poisson"])
-
 
 @dataclass
-class WavLMContrastiveRefConfig(FairseqDataclass):
-    label_rate: int = II("task.label_rate")
+class SHubertConfig(FairseqDataclass):
+    label_rate: float = II("task.label_rate")
 
     extractor_mode: EXTRACTOR_MODE_CHOICES = field(
         default="default",
@@ -69,6 +70,9 @@ class WavLMContrastiveRefConfig(FairseqDataclass):
     )
     activation_fn: ChoiceEnum(utils.get_available_activation_fns()) = field(
         default="gelu", metadata={"help": "activation function to use"}
+    )
+    layer_type: LAYER_TYPE_CHOICES = field(
+        default="transformer", metadata={"help": "layer type in encoder"}
     )
 
     # dropouts
@@ -126,6 +130,7 @@ class WavLMContrastiveRefConfig(FairseqDataclass):
     logit_temp: float = field(
         default=0.1, metadata={"help": "temperature to divide logits by"}
     )
+
     target_glu: bool = field(
         default=False, metadata={"help": "adds projection + glu to targets"}
     )
@@ -199,6 +204,11 @@ class WavLMContrastiveRefConfig(FairseqDataclass):
         metadata={"help": "number of groups for convolutional positional embedding"},
     )
 
+    latent_temp: Tuple[float, float, float] = field(
+        default=(2, 0.5, 0.999995),
+        metadata={"help": "legacy (to be removed)"},
+    )
+
     # loss computation
     skip_masked: bool = field(
         default=False,
@@ -209,42 +219,40 @@ class WavLMContrastiveRefConfig(FairseqDataclass):
         metadata={"help": "skip computing losses over unmasked frames"},
     )
 
-    normalize: bool = field(
+    checkpoint_activations: bool = field(
         default=False,
-        metadata={"help": "for compatibility with official WavLM models"},
+        metadata={"help": "recompute activations and save memory for extra compute"},
     )
 
-    ####################################################
-    # new parameters (in addition to HuBERT) for WavLM #
-    ####################################################
-    relative_position_embedding: bool = field(
-        default=False, metadata={"help": "apply relative position embedding"}
+    # FP16 optimization
+    required_seq_len_multiple: int = field(
+        default=2,
+        metadata={
+            "help": "pad the input to encoder such that the sequence length is divisible by multiple"
+        },
     )
-    num_buckets: int = field(
-        default=320,
-        metadata={"help": "number of buckets for relative position embedding"},
-    )
-    max_distance: int = field(
-        default=1280,
-        metadata={"help": "maximum distance for relative position embedding"},
-    )
-    gru_rel_pos: bool = field(
-        default=False, metadata={"help": "apply gated relative position embedding"}
-    )
-    expand_attention_head_size: int = field(default=-1, metadata={"help": "not used"})
 
+    # Conformer
+    depthwise_conv_kernel_size: int = field(
+        default=31,
+        metadata={
+            "help": "depthwise-conv-kernel-size for convolution in conformer layer"
+        },
+    )
+    attn_type: str = field(
+        default="",
+        metadata={"help": "if espnet use ESPNET MHA"},
+    )
+    pos_enc_type: str = field(
+        default="abs",
+        metadata={"help": "Positional encoding type to use in conformer"},
+    )
+    fp16: bool = field(default=False, metadata={"help": "If fp16 is being used"})
+
+    # Added config
     pretrained_ckpt_path: str = field(
         default="",
         metadata={"help": "pretrained hubert checkpoint"},
-    )
-    # speaker
-    speaker_injection_layers: List[int] = field(
-        default_factory=lambda: [5,6,7],
-        metadata={"help": "layers to inject speaker embedding"},
-    )
-    speaker_dim: int = field(
-        default=512,
-        metadata={"help": "speaker embedding dimension"},
     )
 
     # ctr loss
@@ -252,21 +260,29 @@ class WavLMContrastiveRefConfig(FairseqDataclass):
         default=-1,
         metadata={"help": "contrastive layers in the transformer"},
     )
+    
+    # speaker
+    speaker_injection_layers: List[int] = field(
+        default_factory=lambda: [5,6,7],
+        metadata={"help": "layers to inject speaker embedding"},
+    )
+    speaker_dim: int = field(
+        default=192,
+        metadata={"help": "speaker embedding dimension"},
+    )
 
 
-@register_model("wavlm_contrastive_ref", dataclass=WavLMContrastiveRefConfig)
-class WavLMContrastiveRef(BaseFairseqModel):
+@register_model("shubert", dataclass=SHubertConfig)
+class SHubert(BaseFairseqModel):
     def __init__(
         self,
-        cfg: WavLMContrastiveRefConfig,
-        task_cfg: Optional[HubertPretrainingConfig] = None,
-        dictionaries: List[Dictionary] = [None],
+        cfg: SHubertConfig,
+        task_cfg: SHubertPretrainingConfig,
+        dictionaries: List[Dictionary],
     ) -> None:
         super().__init__()
-        logger.info(f"WavLM Config: {cfg}")
-        is_finetuning_or_inference = any([d is None for d in dictionaries])
+        logger.info(f"SHubertConfig Config: {cfg}")
 
-        self.cfg = cfg
         feature_enc_layers = eval(cfg.conv_feature_layers)  # noqa
         self.embed = feature_enc_layers[-1][0]
 
@@ -276,11 +292,8 @@ class WavLMContrastiveRef(BaseFairseqModel):
             mode=cfg.extractor_mode,
             conv_bias=cfg.conv_bias,
         )
-        if not is_finetuning_or_inference:
-            feature_ds_rate = np.prod([s for _, _, s in feature_enc_layers])
-            self.feat2tar_ratio = (
-                cfg.label_rate * feature_ds_rate / task_cfg.sample_rate
-            )
+        feature_ds_rate = np.prod([s for _, _, s in feature_enc_layers])
+        self.feat2tar_ratio = cfg.label_rate * feature_ds_rate / task_cfg.sample_rate
 
         self.post_extract_proj = (
             nn.Linear(self.embed, cfg.encoder_embed_dim)
@@ -306,41 +319,39 @@ class WavLMContrastiveRef(BaseFairseqModel):
         self.dropout_features = nn.Dropout(cfg.dropout_features)
 
         self.feature_grad_mult = cfg.feature_grad_mult
-        if not is_finetuning_or_inference:
-            self.logit_temp = cfg.logit_temp
-            self.skip_masked = cfg.skip_masked
-            self.skip_nomask = cfg.skip_nomask
+        self.logit_temp = cfg.logit_temp
+        # self.logit_temp_ctr = cfg.logit_temp_ctr # ctr loss
+        self.ctr_layer = cfg.ctr_layer # ctr loss
+        self.skip_masked = cfg.skip_masked
+        self.skip_nomask = cfg.skip_nomask
 
-            final_dim = cfg.final_dim if cfg.final_dim > 0 else cfg.encoder_embed_dim
+        self.num_updates = 0
+
+        final_dim = cfg.final_dim if cfg.final_dim > 0 else cfg.encoder_embed_dim
 
         self.mask_emb = nn.Parameter(
             torch.FloatTensor(cfg.encoder_embed_dim).uniform_()
         )
 
-        self.encoder = TransformerEncoder(cfg)
+        self.encoder = TransformerEncoder_1(cfg)
         self.layer_norm = LayerNorm(self.embed)
 
-        self._load_weights(cfg.pretrained_ckpt_path)
+        self.target_glu = None
+        if cfg.target_glu:
+            self.target_glu = nn.Sequential(
+                nn.Linear(final_dim, final_dim * 2), nn.GLU()
+            )
 
-        if not is_finetuning_or_inference:
-            self.target_glu = None
-            if cfg.target_glu:
-                self.target_glu = nn.Sequential(
-                    nn.Linear(final_dim, final_dim * 2), nn.GLU()
-                )
-
-            self.untie_final_proj = cfg.untie_final_proj
-            if self.untie_final_proj:
-                self.final_proj = nn.Linear(
-                    cfg.encoder_embed_dim, final_dim * len(dictionaries)
-                )
-            else:
-                self.final_proj = nn.Linear(cfg.encoder_embed_dim, final_dim)
-        self.linear_block = LinearBlock(cfg.encoder_embed_dim)
-        self.ctr_layer = cfg.ctr_layer
+        self.untie_final_proj = cfg.untie_final_proj
+        if self.untie_final_proj:
+            self.final_proj = nn.Linear(
+                cfg.encoder_embed_dim, final_dim * len(dictionaries)
+            )
+        else:
+            self.final_proj = nn.Linear(cfg.encoder_embed_dim, final_dim)
 
         # modules below are not needed during fine-tuning
-        if is_finetuning_or_inference:
+        if any([d is None for d in dictionaries]):
             logger.info("cannot find dictionary. assume will be used for fine-tuning")
         else:
             self.num_classes = [len(d) for d in dictionaries]
@@ -348,15 +359,24 @@ class WavLMContrastiveRef(BaseFairseqModel):
                 torch.FloatTensor(sum(self.num_classes), final_dim)
             )
             nn.init.uniform_(self.label_embs_concat)
+        self._load_weights(cfg.pretrained_ckpt_path)
+
+        # For contrastive loss
+        # self.n_negatives = cfg.num_negatives
+        # self.cross_sample_negatives = cfg.cross_sample_negatives
+        # self.layer_proj = nn.Linear(cfg.encoder_embed_dim, final_dim)
+        # self.num_sc_samples = cfg.num_sc_samples
+        self.linear_block = LinearBlock(cfg.encoder_embed_dim)
 
     def _load_weights(self, pretrained_ckpt_path):
-        pretrained_model_dict = torch.load(pretrained_ckpt_path)['model']
+        pretrained_model_dict = load_checkpoint_to_cpu(pretrained_ckpt_path)['model']
         model_dict = self.state_dict()
         for name in model_dict.keys():
             if name in pretrained_model_dict.keys():
                 model_dict[name] = pretrained_model_dict[name]
             # FIXME: munually setting the layers
             elif 'encoder.layers.' in name:
+                # if '_layer_norm.weight_ln.weight' in name or '_layer_norm.bias_ln.weight' in name:
                 if '_layer_norm.ln_weight_' in name:
                     logger.info(f"{name} is from Conditional Layer Norm, skipping")
                     pass
@@ -367,7 +387,7 @@ class WavLMContrastiveRef(BaseFairseqModel):
                 logger.info(f"{name} not in the model")
                 raise NotImplementedError
         self.load_state_dict(model_dict, strict=True)
-        logger.info("Loaded pretrained pretrained parameterssuccessfully")
+        logger.info("Loaded pretrained hubert successfully")
 
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""
@@ -376,14 +396,13 @@ class WavLMContrastiveRef(BaseFairseqModel):
         return state_dict
 
     @classmethod
-    def build_model(cls, cfg: WavLMContrastiveRefConfig, task: HubertPretrainingTask):
+    def build_model(cls, cfg: SHubertConfig, task: SHubertPretrainingTask):
         """Build a new model instance."""
 
-        model = WavLMContrastiveRef(cfg, task.cfg, task.dictionaries)
+        model = SHubert(cfg, task.cfg, task.dictionaries)
         return model
 
-    def apply_mask(self, x, padding_mask):
-        B, T, C = x.shape
+    def get_mask(self, B, T, padding_mask):
         if self.mask_prob > 0:
             mask_indices = compute_mask_indices(
                 (B, T),
@@ -396,32 +415,100 @@ class WavLMContrastiveRef(BaseFairseqModel):
                 no_overlap=self.no_mask_overlap,
                 min_space=self.mask_min_space,
             )
-            mask_indices = torch.from_numpy(mask_indices).to(x.device)
-            x[mask_indices] = self.mask_emb
+            # mask_indices = torch.from_numpy(mask_indices).to(x.device)
+            # x[mask_indices] = self.mask_emb
         else:
             mask_indices = None
 
-        if self.mask_channel_prob > 0:
-            mask_channel_indices = compute_mask_indices(
-                (B, C),
-                None,
-                self.mask_channel_prob,
-                self.mask_channel_length,
-                self.mask_channel_selection,
-                self.mask_channel_other,
-                no_overlap=self.no_mask_channel_overlap,
-                min_space=self.mask_channel_min_space,
-            )
-            mask_channel_indices = (
-                torch.from_numpy(mask_channel_indices)
-                .to(x.device)
-                .unsqueeze(1)
-                .expand(-1, T, -1)
-            )
-            x[mask_channel_indices] = 0
+        # jr: turn off channel masking first
+        assert self.mask_channel_prob == 0, "Currently don't support channel masking"
+        # return x, mask_indices
+        return mask_indices
 
-        return x, mask_indices
-    
+    def sample_negatives(self, y, num, padding_count=None):
+        if self.n_negatives == 0 and self.cross_sample_negatives == 0:
+            return y.new(0)
+
+        bsz, tsz, fsz = y.shape
+        y = y.view(-1, fsz)  # BTC => (BxT)C
+
+        # FIXME: what happens if padding_count is specified?
+        # jr: e.g. y has shape B x 201 x 256, we are choosing 100 negative samples for 201 frames
+        cross_high = tsz * bsz
+        high = tsz - (padding_count or 0)
+        with torch.no_grad():
+            assert high > 1, f"{bsz,tsz,fsz}"
+
+            if self.n_negatives > 0:
+                tszs = (
+                    buffered_arange(num)
+                    .unsqueeze(-1)
+                    .expand(-1, self.n_negatives)
+                    .flatten()
+                )
+                # jr: e.g. tszs = [0,...,0,1,...,1,...,200,...,200], representing 100 negative samples for 201 frames
+
+                neg_idxs = torch.randint(
+                    low=0, high=high - 1, size=(bsz, self.n_negatives * num)
+                ) # jr: randomly choose indexes from 0 to 200 for B batches
+                neg_idxs[neg_idxs >= tszs] += 1 # jr: if idx < tszs, meaning selecting past frames; we left it as it is
+                # if idx >= tszs, meaning selecting current or future frames; we move it 1 frame forward,
+                # this avoids selecting current frames and also cover 'high' (only 'high-1' is used in prev selection)
+
+            if self.cross_sample_negatives > 0:
+                tszs = (
+                    buffered_arange(num)
+                    .unsqueeze(-1)
+                    .expand(-1, self.cross_sample_negatives)
+                    .flatten()
+                )
+
+                cross_neg_idxs = torch.randint(
+                    low=0,
+                    high=cross_high - 1,
+                    size=(bsz, self.cross_sample_negatives * num),
+                )
+                cross_neg_idxs[cross_neg_idxs >= tszs] += 1
+
+        if self.n_negatives > 0:
+            neg_idxs = neg_idxs + (torch.arange(bsz).unsqueeze(1) * high)
+        else:
+            neg_idxs = cross_neg_idxs
+
+        if self.cross_sample_negatives > 0 and self.n_negatives > 0:
+            neg_idxs = torch.cat([neg_idxs, cross_neg_idxs], dim=1)
+
+        neg_idxs[0][0] = 0
+
+        negs = y[neg_idxs.view(-1)]
+        negs = negs.view(
+            bsz, num, self.n_negatives + self.cross_sample_negatives, fsz
+        ).permute(
+            2, 0, 1, 3
+        )  # to NxBxTxC
+        return negs, neg_idxs
+
+    def compute_sim(self, x, y, negatives):
+        neg_is_pos = (y == negatives).all(-1)
+        y = y.unsqueeze(0)
+        targets = torch.cat([y, negatives], dim=0)
+
+        logits = torch.cosine_similarity(x.float(), targets.float(), dim=-1).type_as(x)
+
+        logits = logits / self.logit_temp_ctr
+
+        if is_xla_tensor(logits) or neg_is_pos.any():
+            fillval = -float(2 ** 30)
+            if not hasattr(self, "_inftensor"):
+                self._inftensor = (
+                    torch.tensor(fillval).to(x.device)
+                    if is_xla_tensor(logits)
+                    else float("-inf")
+                )
+            logits[1:] = index_put(logits[1:], neg_is_pos, self._inftensor)
+
+        return logits
+
     def compute_nce(self, x, pos, negs):
         neg_is_pos = (pos == negs).all(-1)
         pos = pos.unsqueeze(0)
@@ -452,6 +539,7 @@ class WavLMContrastiveRef(BaseFairseqModel):
         # Trim features to ensure labels exist and then get aligned labels
         feat_tsz = features.size(2)
         targ_tsz = min([t.size(1) for t in target_list])
+        # jr: self.feat2tar_ratio = 1.0
         if self.feat2tar_ratio * feat_tsz > targ_tsz:
             feat_tsz = int(targ_tsz / self.feat2tar_ratio)
             features = features[..., :feat_tsz]
@@ -471,49 +559,36 @@ class WavLMContrastiveRef(BaseFairseqModel):
         padding_mask = padding_mask.all(-1)
         return padding_mask
 
+    def set_num_updates(self, num_updates):
+        """Set the number of parameters updates."""
+        super().set_num_updates(num_updates)
+        self.num_updates = num_updates
+
     def forward(
         self,
         source: torch.Tensor,
-        spk_emb: torch.Tensor,
-        paired_source: torch.Tensor = None,
         target_list: Optional[List[torch.Tensor]] = None,
         padding_mask: Optional[torch.Tensor] = None,
         mask: bool = True,
+        paired_source: torch.Tensor = None,
+        spk_emb: torch.Tensor = None,
+        clean_source: torch.Tensor = None,
         features_only: bool = False,
         output_layer: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
-        source = torch.cat([source, paired_source], dim=0) 
+        source = torch.cat([source, paired_source], dim=0)
         if padding_mask is not None:
             padding_mask = torch.cat([padding_mask, padding_mask], dim=0)
 
         """output layer is 1-based"""
-        features, features_pen, target_list, padding_mask = self.forward_conv(
-            source, target_list=target_list, padding_mask=padding_mask
-        )
-        if target_list is not None:
-            for j, t in enumerate(target_list): # jr: use same targets for both batches
-                target_list[j] = t.repeat(2, 1)
+        features = self.forward_features(source) # B x D x T
 
-        return self.forward_transformer(
-            features,
-            features_pen,
-            spk_emb,
-            target_list=target_list,
-            padding_mask=padding_mask,
-            mask=mask,
-            features_only=features_only,
-            output_layer=output_layer,
-        )
-
-    def forward_conv(
-        self,
-        source: torch.Tensor,
-        target_list: Optional[List[torch.Tensor]] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-    ):
-        features = self.forward_features(source)
+        # jr: len(target_list[0]) = l
         if target_list is not None:
             features, target_list = self.forward_targets(features, target_list)
+            for j, t in enumerate(target_list): # jr: use same targets for both batches
+                target_list[j] = t.repeat(2, 1)
+        # jr: len(target_list[0]) = 2 * l
 
         features_pen = features.float().pow(2).mean()
 
@@ -522,29 +597,35 @@ class WavLMContrastiveRef(BaseFairseqModel):
         # unmasked_features = features.clone()
 
         if padding_mask is not None:
-            padding_mask = self.forward_padding_mask(features, padding_mask)
+            padding_mask = self.forward_padding_mask(features, padding_mask) # Get padding mask according to the shape of features
 
         if self.post_extract_proj is not None:
             features = self.post_extract_proj(features)
 
+        # FIXME: should i use identical dropouts for both source & paired_source?
         features = self.dropout_input(features)
         # unmasked_features = self.dropout_features(unmasked_features)
-        return features, features_pen, target_list, padding_mask
 
-    def forward_transformer(
-        self,
-        features: torch.Tensor,
-        features_pen: torch.Tensor,
-        spk_emb: torch.Tensor,
-        target_list: Optional[List[torch.Tensor]] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-        mask: bool = True,
-        features_only: bool = False,
-        output_layer: Optional[int] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """output layer is 1-based"""
-        if mask:
-            x, mask_indices = self.apply_mask(features, padding_mask)
+        # # clean source
+        # with torch.no_grad():
+        #     clean_features = self.forward_features(clean_source)
+        #     if clean_features.shape[-1] != features.shape[-2]:
+        #         clean_features = clean_features[..., :features.shape[-2]]
+        #     clean_features = clean_features.transpose(1, 2)
+        #     clean_features = self.layer_norm(clean_features)
+        #     if self.post_extract_proj is not None:
+        #         clean_features = self.post_extract_proj(clean_features)
+        #     clean_features = self.dropout_input(clean_features)
+
+        if mask: # FIXME NOT NEEDED NOW: use identical masking for both branches
+            B, T, _ = features.shape
+            mask_indices = self.get_mask(B//2, T, padding_mask)
+            mask_indices = torch.from_numpy(mask_indices).to(features.device)
+            mask_indices = mask_indices.repeat(2, 1)
+            features[mask_indices] = self.mask_emb
+            x = features
+            unmasked_indices = torch.logical_and(~padding_mask, ~mask_indices)
+            # unmasked_indices = ~mask_indices
         else:
             x = features
             mask_indices = None
@@ -556,19 +637,64 @@ class WavLMContrastiveRef(BaseFairseqModel):
         # mask_indices: (B, T), bool
         x, layer_results = self.encoder(
             x,
-            spk_emb.repeat(2, 1) if spk_emb is not None else None, 
+            spk_emb.repeat(2, 1) if spk_emb is not None else None, # same spk embeddings for source and paired_source
+            # ctr_layer=self.ctr_layer,
+            # need_weights=True,
             padding_mask=padding_mask,
             layer=None if output_layer is None else output_layer - 1,
         )
 
+        # with torch.no_grad():
+        #     tgt_layer = max(self.ctr_layer, -len(layer_results))
+        #     if tgt_layer < 0:
+        #         tgt_layer = len(layer_results) + tgt_layer
+        #     clean_x, clean_layer_results = self.encoder(
+        #         clean_features,
+        #         spk_emb,
+        #         # need_weights=True,
+        #         padding_mask=padding_mask[:B//2, :],
+        #         layer=tgt_layer
+        #     )
+
         if features_only:
-            raise NotImplementedError
-            return {
-                "x": x,
-                "padding_mask": padding_mask,
-                "features": features,
-                "layer_results": layer_results,
-            }
+            raise NotImplementedError("Please use extract_features() to get features")
+
+        # V1: adopted from contentvec, prepare representation contrastive loss, using unmasked indices
+        score_list = []
+        # if self.training:
+        #     y = layer_results[max(self.ctr_layer, -len(layer_results))]  # LAYER DROP??
+        #     y = y[0].transpose(0, 1)
+        #     y = y[unmasked_indices].view(y.size(0), -1, y.size(-1))
+        #     y_1, y_2 = torch.split(y, B // 2, dim=0)
+        #     y_1 = self.layer_proj(y_1)
+        #     y_2 = self.layer_proj(y_2)
+        #
+        #     negs_1, _ = self.sample_negatives(y_1, y_1.size(1))
+        #     negs_2, _ = self.sample_negatives(y_2, y_2.size(1))
+        #     z_1 = self.compute_sim(y_1, y_2, negs_1)
+        #     z_2 = self.compute_sim(y_2, y_1, negs_2)
+        #     z = torch.cat((z_1, z_2), dim=1)
+        #     score_list.append(z)
+
+        # V2: use attention maps
+        # if self.training:
+        #     attn_maps = layer_results[max(self.ctr_layer, -len(layer_results))]
+        #     attn_maps = attn_maps[1]
+        #     attn_1, attn_2 = torch.split(attn_maps, B // 2, dim=0)
+        #     clean_attn_map = clean_layer_results[-1][1]
+        #     score_1 = torch.norm(attn_1 - clean_attn_map)
+        #     score_2 = torch.norm(attn_2 - clean_attn_map)
+        #     score = score_1 + score_2
+        #     # score = torch.norm(attn_1 - attn_2)
+        #     score_list.append(score)
+
+        # V3:
+        if self.training:
+            if self.ctr_layer == -1:
+                x_1, x_2 = torch.split(self.linear_block(x), B // 2, dim=0)
+                score_list.append(self.barlow_twin_loss(x_1, x_2))
+            else:
+                raise NotImplementedError
 
         def compute_pred(proj_x, target, label_embs):
             # compute logits for the i-th label set
@@ -582,21 +708,15 @@ class WavLMContrastiveRef(BaseFairseqModel):
             # negs: (Neg, S, D)
             return self.compute_nce(proj_x, y, negs)
 
-        score_list = []
-        if self.training:
-            if self.ctr_layer == -1:
-                B = x.shape[0]
-                x_1, x_2 = torch.split(self.linear_block(x), B // 2, dim=0)
-                score_list.append(self.barlow_twin_loss(x_1, x_2))
-            else:
-                raise NotImplementedError
-
+        # jr: self.label_embs_concat.shape: [504 (500 cluster + some other tokens), 256]
+        # jr: self.num_classes = 504
+        # jr: torch.split(tensor, split_size_or_section, dim=0): split self.label_embs_concat accordding to indices in self.num_classes
         label_embs_list = self.label_embs_concat.split(self.num_classes, 0)
 
-        if not self.skip_masked:
+        if not self.skip_masked: # jr: self.skip_masked = False
             masked_indices = torch.logical_and(~padding_mask, mask_indices)
             proj_x_m = self.final_proj(x[masked_indices])
-            if self.untie_final_proj:
+            if self.untie_final_proj: # jr: True
                 proj_x_m_list = proj_x_m.chunk(len(target_list), dim=-1)
             else:
                 proj_x_m_list = [proj_x_m for _ in range(len(target_list))]
@@ -607,7 +727,7 @@ class WavLMContrastiveRef(BaseFairseqModel):
         else:
             logit_m_list = [None for _ in target_list]
 
-        if not self.skip_nomask:
+        if not self.skip_nomask: # jr: self.skip_nomask = False
             nomask_indices = torch.logical_and(~padding_mask, ~mask_indices)
             proj_x_u = self.final_proj(x[nomask_indices])
             if self.untie_final_proj:
@@ -634,25 +754,45 @@ class WavLMContrastiveRef(BaseFairseqModel):
     def extract_features(
         self,
         source: torch.Tensor,
+        spk_emb: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         mask: bool = False,
         ret_conv: bool = False,
         output_layer: Optional[int] = None,
-        ret_layer_results: bool = False,
-    ):
-        raise NotImplementedError
-        # res = self.forward(
-        #     source,
-        #     padding_mask=padding_mask,
-        #     mask=mask,
-        #     features_only=True,
-        #     output_layer=output_layer,
-        # )
-        #
-        # feature = res["features"] if ret_conv else res["x"]
-        # if ret_layer_results:
-        #     feature = (feature, res["layer_results"])
-        # return feature, res["padding_mask"]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """output layer is 1-based"""
+        features = self.forward_features(source) # B x D x T
+
+        features = features.transpose(1, 2)
+        features = self.layer_norm(features)
+
+        if padding_mask is not None:
+            padding_mask = self.forward_padding_mask(features, padding_mask) # Get padding mask according to the shape of features
+
+        if self.post_extract_proj is not None:
+            features = self.post_extract_proj(features)
+
+        features = self.dropout_input(features)
+
+        if mask: # FIXME NOT NEEDED NOW: use identical masking for both branches
+            B, T, _ = features.shape
+            mask_indices = self.get_mask(B, T, padding_mask)
+            mask_indices = torch.from_numpy(mask_indices).to(features.device)
+            features[mask_indices] = self.mask_emb
+            x = features
+        else:
+            x = features
+            mask_indices = None
+
+        x, layer_results = self.encoder(
+            x,
+            spk_emb, # same spk embeddings for source and paired_source
+            padding_mask=padding_mask,
+            layer=None if output_layer is None else output_layer - 1,
+        )
+
+        return {"x": x, "padding_mask": padding_mask, "features": features, "layer_results": layer_results}
+
 
     def get_logits(self, net_output, is_masked=True):
         if is_masked:
@@ -681,6 +821,28 @@ class WavLMContrastiveRef(BaseFairseqModel):
         self.target_glu = None
         self.final_proj = None
 
+    def get_logits_ctr(self, net_output):
+        logits_list = net_output["score_list"]
+        if len(logits_list) > 1:
+            logits_B = []
+            for logits in logits_list:
+                logits = logits.transpose(0, 2)
+                logits = logits.reshape(-1, logits.size(-1))
+                logits_B.append(logits)
+            logits_B = torch.cat(logits_B, dim=0)
+        else:
+            logits = logits_list[0]
+            logits = logits.transpose(0, 2)
+            logits_B = logits.reshape(-1, logits.size(-1))
+        return logits_B
+
+    def get_targets_ctr(self, net_output):
+        logits_list = net_output["score_list"]
+        logits = logits_list[0]
+        return logits.new_zeros(
+            logits.size(1) * logits.size(2) * len(logits_list),
+            dtype=torch.long)
+
     def barlow_twin_loss(self, z1, z2, num_samples=640, bt_lambda=0.005):
         """
         Feature dim size (z1, z2): (bs , t , p_dim)
@@ -700,6 +862,10 @@ class WavLMContrastiveRef(BaseFairseqModel):
             # FIXME: the next line is not tested zero padding tokens as the pre-training does not use padding
             non_zeros = [T - (z1[i] == 0).sum(0).min() for i in range(B)]
             sample_indices = [[torch.randint(i, size=(int(i / sum(non_zeros) * num_samples),))] for i in non_zeros]
+            # Note that the paper mentioned: "smaller sample size benefits early-stage learning"
+            # Here the sample_indices roughly ranges from [20+] to [90+]
+            #for s in sample_indices:
+            #    print(s[0].shape)
             z1 = torch.cat([z1[bs][i] for bs, i in enumerate(sample_indices)])
             z2 = torch.cat([z2[bs][i] for bs, i in enumerate(sample_indices)])
             T = num_samples
@@ -708,6 +874,9 @@ class WavLMContrastiveRef(BaseFairseqModel):
         z2_norm = (z2 - z2.mean(0)) / z2.std(0)
 
         c = torch.mm(z1_norm.T, z2_norm) / T
+        #import pickle as pkl
+        #pkl.dump(c.detach().cpu(), open('/raid/hpc/gemeng/se_asr/hubert_contrastive/utils/c_matrix_notctr.pkl', 'wb'))
+        #exit()
 
         c_diff = (c - eye.float().to(c.device)).pow(2)  # DxD
         invariance = c_diff * eye.float().to(c_diff.device)
@@ -716,7 +885,6 @@ class WavLMContrastiveRef(BaseFairseqModel):
         loss = torch.sum(invariance + redundant)
 
         return loss
-
 
 class LinearBlock(nn.Module):
     def __init__(self, in_dim) -> None:
@@ -744,3 +912,6 @@ class LinearBlock(nn.Module):
 
         x = self.up2(x)
         return x
+
+
+

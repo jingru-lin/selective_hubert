@@ -35,8 +35,8 @@ class HubertCriterionConfig(FairseqDataclass):
     )
 
 
-@register_criterion("hubert_contrastive", dataclass=HubertCriterionConfig)
-class HubertContrastiveCriterion(FairseqCriterion):
+@register_criterion("shubert_criterion", dataclass=HubertCriterionConfig)
+class SHubertCriterion(FairseqCriterion):
     def __init__(
         self,
         task,

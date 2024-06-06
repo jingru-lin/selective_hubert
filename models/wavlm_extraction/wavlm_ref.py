@@ -27,12 +27,12 @@ from fairseq.data.dictionary import Dictionary
 from fairseq.dataclass import ChoiceEnum, FairseqDataclass
 from fairseq.models import BaseFairseqModel, register_model
 from fairseq.modules import GradMultiply
-from fairseq.tasks.hubert_pretraining import (
-    HubertPretrainingConfig,
-    HubertPretrainingTask,
-)
 
-from hubert_contrastive.models.wavlm_extraction.wavlm_encoder import (
+from selective_hubert.tasks.shubert_pretraining import (
+    SHubertPretrainingConfig,
+    SHubertPretrainingTask
+)
+from selective_hubert.models.wavlm_extraction.wavlm_encoder import (
     ConvFeatureExtractionModel, TransformerEncoder
 )
 
@@ -249,7 +249,7 @@ class WavLMRef(BaseFairseqModel):
     def __init__(
         self,
         cfg: WavLMRefConfig,
-        task_cfg: Optional[HubertPretrainingConfig] = None,
+        task_cfg: Optional[SHubertPretrainingConfig] = None,
         dictionaries: List[Dictionary] = [None],
     ) -> None:
         super().__init__()
@@ -364,7 +364,7 @@ class WavLMRef(BaseFairseqModel):
         return state_dict
 
     @classmethod
-    def build_model(cls, cfg: WavLMRefConfig, task: HubertPretrainingTask):
+    def build_model(cls, cfg: WavLMRefConfig, task: SHubertPretrainingTask):
         """Build a new model instance."""
 
         model = WavLMRef(cfg, task.cfg, task.dictionaries)

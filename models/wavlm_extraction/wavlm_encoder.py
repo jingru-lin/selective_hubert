@@ -25,8 +25,8 @@ from fairseq.modules import (
 )
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
 
-from hubert_contrastive.models.wavlm_extraction.modules import GLU_Linear, MultiheadAttention
-from hubert_contrastive.modules import CondLayerNorm
+from selective_hubert.models.wavlm_extraction.modules import GLU_Linear, MultiheadAttention
+from selective_hubert.modules import CondLayerNorm
 
 def manual_layer_norm(x, layer_weight, layer_bias, layer_eps):
     mean = x.mean(-1, keepdim=True)
