@@ -38,5 +38,5 @@ task.spk_embedding_dir=/dir/to/extracted/cam_embeddings
 ```
 
 ## Inference:
-Download the [pre-trained model](https://drive.google.com/file/d/1YvxyXkt2JrQRmMkOF6IY_mJqnzYoNQV9/view?usp=drive_link) here.
+Download the [pre-trained models](https://drive.google.com/drive/folders/1aflgoMgo1urYjA0K5O9_dridv9yv5jGD?usp=sharing) here.
 Refer to inference.py for how to extract representations. 
