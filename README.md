@@ -29,7 +29,7 @@ To pretrain the model, use the provided config that contains the default hyperpa
 Change the following paths in pretrain.sh and run it:
 ```
 --config-dir /dir/to/selective_hubert/config
---config-name hubert_contrastive_ref2_base_librispeech.yaml
+--config-name shubert_base_librispeech.yaml
 task.data=/dir/to/data
 task.label_dir=/dir/to/label
 common.user_dir=/dir/to/selective_hubert
