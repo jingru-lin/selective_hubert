@@ -367,7 +367,7 @@ class SWavLM(BaseFairseqModel):
                 logger.info(f"{name} not in the model")
                 raise NotImplementedError
         self.load_state_dict(model_dict, strict=True)
-        logger.info("Loaded pretrained pretrained parameterssuccessfully")
+        logger.info("Loaded pretrained pretrained parameters successfully")
 
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""

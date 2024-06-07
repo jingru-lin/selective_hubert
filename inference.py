@@ -10,7 +10,7 @@ fairseq.tasks.import_tasks('../path/to/selective_hubert/selective_hubert/tasks',
 fairseq.models.import_models('../path/to/selective_hubert/selective_hubert/models', 'selective_hubert.models')
 
 # Load checkpoint
-ckpt_path = "checkpoints/checkpoint_last.pt"
+ckpt_path = "checkpoints/checkpoint_best.pt"
 models, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([ckpt_path])
 model = models[0]
 model.eval()
