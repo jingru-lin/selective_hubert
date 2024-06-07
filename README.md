@@ -36,3 +36,7 @@ common.user_dir=/dir/to/selective_hubert
 model.pretrained_ckpt_path=/dir/to/pretrained/hubert_base_ls960.pt
 task.spk_embedding_dir=/dir/to/extracted/cam_embeddings
 ```
+
+## Inference:
+Download the [pre-trained model](https://drive.google.com/file/d/1YvxyXkt2JrQRmMkOF6IY_mJqnzYoNQV9/view?usp=drive_link) here.
+Refer to inference.py for how to extract representations. 
