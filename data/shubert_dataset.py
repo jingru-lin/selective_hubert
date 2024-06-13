@@ -283,7 +283,7 @@ class SHubertDataset(FairseqDataset):
         # Hence, we sample 1 more noise audio
         # Also, a ratio is applied to allow some clean speech,
         # so that the model can still be trained on some clean speech (also for contrastive loss later)
-        if self.get_multiple_prob > 0 and wav_length > len(wav):
+        if self.get_multiple_prob >= np.random.random() and wav_length > len(wav):
             noise_idx = np.random.randint(0, len(self.noise_names))
             noise_path = os.path.join(self.noise_root, self.noise_names[noise_idx])
             wav2, cur_sample_rate = sf.read(noise_path)
